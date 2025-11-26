@@ -1,0 +1,2727 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_system.h"
+#include "mdns.h"
+
+#include "esp_http_client.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_server.h"
+
+#include "esp_sntp.h"
+
+#include "cJSON.h"
+#include "mbedtls/base64.h"
+
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_adc/adc_oneshot.h"
+#include "public_ip_component.h"
+
+#include "aqi_uae.h"
+
+// ========================
+// ===== CONFIGURATION =====
+// ========================
+
+// UART Configuration for ESP32-S3
+#define DATA_UART_PORT      UART_NUM_1
+#define DATA_UART_TX_PIN    GPIO_NUM_10
+#define DATA_UART_RX_PIN    GPIO_NUM_9
+#define DATA_BAUD_RATE      115200
+#define BUF_SIZE            256
+
+// Sensor UART Configuration
+#define SENSOR_UART_PORT    UART_NUM_2
+#define SENSOR_UART_TX_PIN  GPIO_NUM_17
+#define SENSOR_UART_RX_PIN  GPIO_NUM_16
+#define SENSOR_BAUD_RATE    9600
+
+// MUX Configuration
+#define BANK_SEL GPIO_NUM_12
+#define SEL0     GPIO_NUM_25
+#define SEL1     GPIO_NUM_26
+#define SEL2     GPIO_NUM_27
+#define SEL3     GPIO_NUM_14
+
+#define SETTLE_MS      200
+#define READ_DELAY_MS  500
+
+// Sensor Tags
+#define TAG "ALL_SENSORS"
+#define TAG_BENZENE "BENZENE"
+#define TAG_PM "PM_SENSOR"
+#define TAG_NOISE "NoiseSensor"
+#define TAG_ZS11 "ZS11"
+#define TAG_CH2O "CH2O_SENSOR"
+#define TAG_NO2 "NO2_SENSOR"
+#define TAG_VOC "VOC_SENSOR"
+#define TAG_SO2 "SO2_SENSOR"
+#define TAG_O3 "O3_SENSOR"
+#define TAG_CO "CO_SENSOR"
+
+// Benzene ADC Settings
+#define ADC_UNIT ADC_UNIT_1
+#define ADC_CHANNEL ADC_CHANNEL_3
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define ADC_WIDTH ADC_BITWIDTH_12
+
+#define SENSOR_VREF 3.3f
+#define BIAS_VOLTAGE 0.3f
+#define NUM_SAMPLES 10
+
+// ZS11 Temperature & Humidity Settings
+#define I2C_MASTER_SCL_IO           22
+#define I2C_MASTER_SDA_IO           21
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ          100000
+#define ZS11_SENSOR_ADDR            0x38
+
+// VOC Sensor Pins
+#define VOC_SENSOR_PIN_A GPIO_NUM_5
+#define VOC_SENSOR_PIN_B GPIO_NUM_18
+
+// DOH API Configuration
+#define DOH_API_BASE_URL   "https://ieprod.doh.gov.ae/DOHInt/Restful/OIAQAD"
+#define TOKEN_URL          DOH_API_BASE_URL "/oauth/token"
+#define DATA_URL           DOH_API_BASE_URL "/data"
+
+// DOH Headers Configuration
+#define DOHGatewayAPIKey   "D9n2j-pR9XN-Ltq1c-Zu0m1-3VHet"
+#define OS_VERSION         "1.1"
+
+// WiFi Configuration - Starts with hardcoded IAQ_, then updates to IAQ_deviceid
+#define WIFI_AP_INITIAL_SSID  "IAQ_"
+#define WIFI_AP_PASS       ""
+#define WIFI_AP_CHANNEL    1
+#define MAX_STA_CONN       4
+
+static char wifi_ap_ssid[32] = "IAQ_"; // Starts with hardcoded IAQ_, will be updated to IAQ_deviceid
+
+static const char *CLIENT_ID = "supremeclientapp";
+static const char *CLIENT_SECRET = "supreme4321";
+static const char *OAUTH_PASSWORD = "OTk5OTk=";
+
+/* Event bits */
+static EventGroupHandle_t s_evt_group;
+#define WIFI_CONNECTED_BIT   BIT0
+#define WIFI_FAIL_BIT        BIT1
+#define TIME_SYNCED_BIT      BIT2
+
+/* HTTP server handle */
+static httpd_handle_t s_http_server = NULL;
+
+/* Buffers for received credentials */
+static char received_ssid[64];
+static char received_pass[64];
+static char device_id[32] = {0};
+// Add this extern declaration to access the public IP from public_ip_component.c
+extern char esp32_public_ip[16];
+/* Network info */
+static char esp32_private_ip[16] = "192.168.1.100";
+static char esp32_mac[18] = "00:00:00:00:00:00";
+static uint32_t last_bucket_index = 0;
+
+/* Offset parameters structure */
+typedef struct {
+    char parameter_id[32];
+    float x_offset;
+    float y_offset;
+} offset_param_t;
+
+static offset_param_t g_offsets[20];
+static int g_offset_count = 0;
+
+/* Token state */
+typedef struct {
+    char *access_token;
+    time_t expires_at;
+} token_state_t;
+
+static token_state_t g_token = { .access_token = NULL, .expires_at = 0 };
+
+/* Retry counters */
+static int s_retry_num = 0;
+static const int MAX_RETRY = 10;
+
+// Sensor data structure
+typedef struct {
+    // Gas Sensors
+    float co;        // mg/m³
+    float o3;        // µg/m³  
+    float no2;       // µg/m³
+    float co2;       // ppm
+    float ch2o;      // µg/m³
+    float so2;       // µg/m³
+    float benzene;   // ppm
+    float voc; 
+    
+    // Particulate Matter
+    float pm2_5;     // µg/m³
+    float pm10;      // µg/m³
+    
+    // Noise
+    float noise;     // dB
+    
+    // Temperature & Humidity
+    float temperature; // ℃
+    float humidity;    // %
+    
+    // AQI Data
+    int aqi;
+    const char *aqi_band;
+    const char *dominant_pollutant;
+    
+    bool data_valid;
+    time_t timestamp;
+    char timestamp_str[64];
+} sensor_data_t;
+
+static QueueHandle_t sensor_data_queue;
+static adc_oneshot_unit_handle_t adc1_handle;
+
+// WiFi and Power status
+static bool wifi_active = false;
+static bool internet_available = false;
+
+/* ---------- Parameter Name to Sensor ID Mapping ---------- */
+typedef struct {
+    const char* param_name;
+    const char* sensor_id;
+    const char* description;
+    const char* unit;
+} param_mapping_t;
+
+static const param_mapping_t g_param_mapping[] = {
+    {"PM2.5",      "5a54b202f1c20", "PM2.5", "µg/m³"},
+    {"PM10",       "5a65aeaa75285", "PM10", "µg/m³"},
+    {"CO",         "5bd02649d73f9", "CO", "mg/m³"},
+    {"O₃",         "59c10c1d8d49f", "O₃", "µg/m³"},
+    {"NO₂",        "5beea162da446", "NO₂", "µg/m³"},
+    {"CO₂",        "59c10c1d8cffb", "CO₂", "ppm"},
+    {"VOC",        "59d787bc91133", "VOC", "grade"},
+    {"CH₂O",       "5be03cbe9f8e9", "CH₂O", "µg/m³"},
+    {"Temperature", "5a65ae47024f8", "Temperature", "℃"},
+    {"Humidity",   "5bd7065cb9d49", "Humidity", "%"},
+    {"Noise",      "noise",         "Noise", "dB"},
+    {"C₆H₆",    "benzene",       "C₆H₆", "ppm"},
+    {"SO₂",        "so2",           "SO₂", "µg/m³"}
+};
+
+static const int g_param_mapping_count = sizeof(g_param_mapping) / sizeof(g_param_mapping[0]);
+
+// ========================
+// ===== 5-MINUTE BUCKET AVERAGING STRUCTURES =====
+// ========================
+
+#define BUCKET_SIZE_SECONDS 300  // 5 minutes
+
+typedef struct {
+    double sum;
+    uint32_t count;
+} RunningStat;
+
+typedef struct {
+    RunningStat aqi;
+    RunningStat pm25;
+    RunningStat pm10;
+    RunningStat co;
+    RunningStat o3;
+    RunningStat no2;
+    RunningStat co2;
+    RunningStat ch2o;
+    RunningStat temp;
+    RunningStat hum;
+    RunningStat tvoc;
+    RunningStat noise;
+    RunningStat benzene;
+    RunningStat so2;
+} WindowStats;
+
+// Global variables for 5-minute window management
+static bool g_windowOpen = false;
+static uint32_t g_currentBucketIdx = 0;
+static WindowStats g_stats;
+
+// ========================
+// ===== FUNCTION DECLARATIONS =====
+// ========================
+
+// Time functions
+void get_current_exact_time_string(char *buffer, size_t buffer_size);
+void print_current_exact_time(void);
+void get_current_exact_timestamp_string(char *buffer, size_t buffer_size);
+void time_sync_task(void *pvParameter);
+
+// 5-Minute Bucket Functions
+static void statsReset(WindowStats *w);
+static void statsAccumulate(WindowStats *w, double aqi, double pm25, double pm10,
+                           double co, double o3, double no2, double co2,
+                           double ch2o, double temp, double hum,
+                           double tvoc, double noise, double benzene, double so2);
+static bool statsBuildCsvLine(const char *ts, const WindowStats *w, char *outCsv, size_t outLen);
+static void process_5min_window(void);
+
+// HTTP Utility Functions
+static char *read_http_response(esp_http_client_handle_t client);
+
+// Sensor Functions
+static void uart_init(void);
+static esp_err_t i2c_master_init(void);
+static void mux_init(void);
+static void select_channel(int bank, int channel, bool group1);
+static uint8_t ze_checksum(uint8_t *data);
+static uint8_t mhz19c_checksum(uint8_t *packet);
+static void benzene_adc_init(void);
+static float read_benzene_sensor(void);
+static esp_err_t zs11_cmd_init(void);
+static esp_err_t zs11_cmd_trigger_measure(void);
+static esp_err_t zs11_read_status(uint8_t *status);
+static esp_err_t zs11_read_measurement(uint8_t *buf6);
+static bool zs11_decode(const uint8_t *b, float *out_t, float *out_rh);
+static int read_temp_humidity_zs11(float *temperature, float *humidity);
+static void initialize_zs11_sensor(void);
+static int read_pm_sensor_improved(int bank, int channel, float *pm2_5, float *pm10);
+static uint16_t modbus_crc(uint8_t *buf, int len);
+static float read_noise_sensor(int bank, int channel);
+static uint8_t ze03_calculate_checksum(uint8_t *data);
+static float read_so2_sensor_improved(int bank, int channel);
+static float read_no2_sensor_improved(int bank, int channel);
+static uint8_t ze07_calculate_checksum(uint8_t *data);
+static float read_ch2o_sensor_improved(int bank, int channel);
+static float read_o3_sensor_improved(int bank, int channel);
+static float read_co_sensor_improved(int bank, int channel);
+static float read_co2_sensor(int bank, int channel);
+static void init_voc_gpio(void);
+static int get_pollution_class(bool A, bool B);
+static float read_voc_sensor(void);
+static void read_all_sensors_complete(sensor_data_t *data);
+static void send_sensor_data_via_uart(sensor_data_t *data);
+static float apply_offset_calculation(const char *sensor_id, float raw_value);
+
+// Internet Check Functions
+static bool check_internet_simple_tcp(void);
+static bool check_internet_connectivity_comprehensive(void);
+static bool quick_internet_check(void);
+
+// Network Functions
+static void get_network_info(void);
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data);
+static void update_ap_name_with_device_id(void);
+static void initialize_mdns(void);
+static bool save_oauth_username(const char* device_id);
+static bool get_oauth_username(char* username, size_t max_len);
+
+// DOH API Functions
+static void get_current_exact_timestamp(cJSON *parent_obj);
+static bool build_basic_auth_header(char *out, size_t out_len);
+static char *json_get_dup(cJSON *root, const char *key);
+static int json_get_int(cJSON *root, const char *key, int def);
+static bool fetch_oauth_token(token_state_t *tok);
+static bool ensure_valid_token(token_state_t *tok);
+static bool send_bulk_data(const char *access_token, sensor_data_t *sensor_data);
+static void send_data_now(sensor_data_t *sensor_data);
+
+// HTTP Server Functions
+static void connect_sta_task(void *pvParameter);
+static esp_err_t post_handler(httpd_req_t *req);
+static void load_offsets_from_nvs(void);
+static httpd_handle_t start_webserver(void);
+static void start_softap(void);
+
+// Task Functions
+static void data_task(void *arg);
+static void sensor_task(void *arg);
+
+// ========================
+// ===== 5-MINUTE BUCKET AVERAGING IMPLEMENTATION =====
+
+// ========================
+static void update_public_ip_on_wifi_connect(void) {
+    if (wifi_active && internet_available) {
+        ESP_LOGI(TAG, "WiFi connected with internet - updating public IP");
+        
+        char public_ip[16] = "0.0.0.0";
+        if (get_public_ip_address(public_ip, sizeof(public_ip))) {
+            ESP_LOGI(TAG, "✅ Public IP updated successfully: %s", public_ip);
+        } else {
+            ESP_LOGW(TAG, "⚠️ Failed to get public IP, using default: %s", esp32_public_ip);
+        }
+    }
+}
+static void statsReset(WindowStats *w) {
+    memset(w, 0, sizeof(WindowStats));
+}
+
+static void statsAccumulate(WindowStats *w, double aqi, double pm25, double pm10,
+                           double co, double o3, double no2, double co2,
+                           double ch2o, double temp, double hum,
+                           double tvoc, double noise, double benzene, double so2) {
+    
+    // Helper function to accumulate valid values
+    #define ACCUMULATE_IF_VALID(rs, value) \
+        do { \
+            if (!isnan(value)) { \
+                rs.sum += value; \
+                rs.count++; \
+            } \
+        } while(0)
+    
+    ACCUMULATE_IF_VALID(w->aqi, aqi);
+    ACCUMULATE_IF_VALID(w->pm25, pm25);
+    ACCUMULATE_IF_VALID(w->pm10, pm10);
+    ACCUMULATE_IF_VALID(w->co, co);
+    ACCUMULATE_IF_VALID(w->o3, o3);
+    ACCUMULATE_IF_VALID(w->no2, no2);
+    ACCUMULATE_IF_VALID(w->co2, co2);
+    ACCUMULATE_IF_VALID(w->ch2o, ch2o);
+    ACCUMULATE_IF_VALID(w->temp, temp);
+    ACCUMULATE_IF_VALID(w->hum, hum);
+    ACCUMULATE_IF_VALID(w->tvoc, tvoc);
+    ACCUMULATE_IF_VALID(w->noise, noise);
+    ACCUMULATE_IF_VALID(w->benzene, benzene);
+    ACCUMULATE_IF_VALID(w->so2, so2);
+    
+    #undef ACCUMULATE_IF_VALID
+}
+
+static bool statsBuildCsvLine(const char *ts, const WindowStats *w, char *outCsv, size_t outLen) {
+    bool anyData = false;
+    char fields[15][32] = {0};
+    
+    // Helper function to calculate average or return empty
+    #define AVG_OR_EMPTY(rs, decimals, field_index) \
+        do { \
+            if (rs.count > 0) { \
+                double avg = rs.sum / (double)rs.count; \
+                snprintf(fields[field_index], sizeof(fields[field_index]), "%.*f", decimals, avg); \
+                anyData = true; \
+            } else { \
+                fields[field_index][0] = '\0'; \
+            } \
+        } while(0)
+    
+    // Calculate averages
+    AVG_OR_EMPTY(w->aqi, 0, 0);
+    AVG_OR_EMPTY(w->pm25, 1, 1);
+    AVG_OR_EMPTY(w->pm10, 1, 2);
+    AVG_OR_EMPTY(w->co, 3, 3);
+    AVG_OR_EMPTY(w->o3, 3, 4);
+    AVG_OR_EMPTY(w->no2, 3, 5);
+    AVG_OR_EMPTY(w->co2, 0, 6);
+    AVG_OR_EMPTY(w->ch2o, 3, 7);
+    AVG_OR_EMPTY(w->temp, 2, 8);
+    AVG_OR_EMPTY(w->hum, 1, 9);
+    AVG_OR_EMPTY(w->tvoc, 3, 10);
+    AVG_OR_EMPTY(w->noise, 1, 11);
+    AVG_OR_EMPTY(w->benzene, 3, 12);
+    AVG_OR_EMPTY(w->so2, 3, 13);
+    
+    #undef AVG_OR_EMPTY
+    
+    // If no data at all, skip this window
+    if (!anyData) {
+        return false;
+    }
+    
+    // Build CSV line
+    int written = snprintf(outCsv, outLen,
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+        ts,
+        fields[0],  // aqi
+        fields[1],  // pm25
+        fields[2],  // pm10
+        fields[3],  // co
+        fields[4],  // o3
+        fields[5],  // no2
+        fields[6],  // co2
+        fields[7],  // ch2o
+        fields[8],  // temp
+        fields[9],  // hum
+        fields[10], // tvoc
+        fields[11], // noise
+        fields[12], // benzene
+        fields[13]  // so2
+    );
+    
+    return (written > 0 && written < outLen);
+}
+static void process_5min_window(void) {
+    if (!g_windowOpen) {
+        return;
+    }
+    
+    ESP_LOGI(TAG, "🔄 PROCESSING 5-MINUTE WINDOW FOR SERVER AND UART");
+    
+    // ✅ The COMPLETED window is last_bucket_index, but we want the END TIME of that window
+    // If last_bucket_index represents 10:35-10:40, the end time is (last_bucket_index + 1) * BUCKET_SIZE_SECONDS
+    time_t windowEndUtc = (time_t)(last_bucket_index + 1) * BUCKET_SIZE_SECONDS;
+    
+    // Format timestamp - this should be the END of the window
+    char tsBuf[20];
+    struct tm tinfo;
+    localtime_r(&windowEndUtc, &tinfo);
+    strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%d %H:%M:%S", &tinfo);
+    
+    // Build CSV line for logging
+    char csvLine[512];
+    if (statsBuildCsvLine(tsBuf, &g_stats, csvLine, sizeof(csvLine))) {
+        ESP_LOGI(TAG, "=== 5-MINUTE WINDOW COMPLETE ===");
+        ESP_LOGI(TAG, "Window End Time: %s", tsBuf);
+        ESP_LOGI(TAG, "CSV Data: %s", csvLine);
+        ESP_LOGI(TAG, "================================");
+        
+        // Create sensor_data_t from averaged data for both server and UART
+        sensor_data_t averaged_data;
+        memset(&averaged_data, 0, sizeof(sensor_data_t));
+        
+        // Fill with averaged values
+        #define SET_AVG_IF_VALID(field, stat) \
+            if (stat.count > 0) { \
+                averaged_data.field = stat.sum / stat.count; \
+            } else { \
+                averaged_data.field = NAN; \
+            }
+        
+        SET_AVG_IF_VALID(pm2_5, g_stats.pm25);
+        SET_AVG_IF_VALID(pm10, g_stats.pm10);
+        SET_AVG_IF_VALID(co, g_stats.co);
+        SET_AVG_IF_VALID(o3, g_stats.o3);
+        SET_AVG_IF_VALID(no2, g_stats.no2);
+        SET_AVG_IF_VALID(co2, g_stats.co2);
+        SET_AVG_IF_VALID(ch2o, g_stats.ch2o);
+        SET_AVG_IF_VALID(temperature, g_stats.temp);
+        SET_AVG_IF_VALID(humidity, g_stats.hum);
+        SET_AVG_IF_VALID(voc, g_stats.tvoc);
+        SET_AVG_IF_VALID(noise, g_stats.noise);
+        SET_AVG_IF_VALID(benzene, g_stats.benzene);
+        SET_AVG_IF_VALID(so2, g_stats.so2);
+        
+        #undef SET_AVG_IF_VALID
+        
+        // Calculate AQI for the averaged data
+        float adjusted_pm2_5 = apply_offset_calculation("5a54b202f1c20", averaged_data.pm2_5);
+        float adjusted_pm10 = apply_offset_calculation("5a65aeaa75285", averaged_data.pm10);
+        float adjusted_no2 = apply_offset_calculation("5beea162da446", averaged_data.no2);
+        float adjusted_so2 = apply_offset_calculation("so2", averaged_data.so2);
+        float adjusted_co = apply_offset_calculation("5bd02649d73f9", averaged_data.co);
+        float adjusted_o3 = apply_offset_calculation("59c10c1d8d49f", averaged_data.o3);
+        
+        aqi_result_t aqi_result = aqi_uae_compute_raw(
+            adjusted_pm2_5, adjusted_pm10, adjusted_no2,
+            adjusted_so2, adjusted_co, adjusted_o3
+        );
+        
+        averaged_data.aqi = aqi_result.aqi;
+        averaged_data.aqi_band = aqi_result.label;
+        averaged_data.dominant_pollutant = aqi_result.dominant_pollutant;
+        
+        // ✅ Use the WINDOW END TIME for both UART and server
+        time_t window_end_time = (time_t)(last_bucket_index + 1) * BUCKET_SIZE_SECONDS;
+        struct tm timeinfo;
+        localtime_r(&window_end_time, &timeinfo);
+        strftime(averaged_data.timestamp_str, sizeof(averaged_data.timestamp_str), 
+                "%Y-%m-%d %H:%M:%S", &timeinfo);
+        
+        averaged_data.data_valid = true;
+        
+        // ✅ FIRST: Send to ESP32-S3 via UART (5-minute averaged data)
+        ESP_LOGI(TAG, "🚀 SENDING 5-MINUTE AVERAGED DATA TO ESP32-S3");
+        ESP_LOGI(TAG, "Window End Time: %s", averaged_data.timestamp_str);
+        send_sensor_data_via_uart(&averaged_data);
+        
+        // ✅ SECOND: Send to DOH server (5-minute averaged data)
+        if (wifi_active && internet_available) {
+            ESP_LOGI(TAG, "🚀 SENDING 5-MINUTE AVERAGED DATA TO DOH SERVER");
+            ESP_LOGI(TAG, "Window End Time: %s", averaged_data.timestamp_str);
+            send_data_now(&averaged_data);
+        } else {
+            ESP_LOGW(TAG, "Cannot send data to server - WiFi or Internet not available");
+        }
+        
+    } else {
+        ESP_LOGI(TAG, "5-minute window skipped - no valid data");
+    }
+    
+    // Reset for next window
+    statsReset(&g_stats);
+}
+
+// ========================
+// ===== SENSOR FUNCTIONS =====
+// ========================
+
+static void uart_init(void) {
+    uart_config_t sensor_uart_config = {
+        .baud_rate = SENSOR_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(SENSOR_UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(SENSOR_UART_PORT, &sensor_uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(SENSOR_UART_PORT, SENSOR_UART_TX_PIN, SENSOR_UART_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    gpio_set_pull_mode(SENSOR_UART_RX_PIN, GPIO_PULLUP_ONLY);
+    
+    uart_config_t data_uart_config = {
+        .baud_rate = DATA_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(DATA_UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(DATA_UART_PORT, &data_uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(DATA_UART_PORT, DATA_UART_TX_PIN, DATA_UART_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    
+    ESP_LOGI(TAG, "UARTs initialized: Sensors=%d baud, Data=%d baud", SENSOR_BAUD_RATE, DATA_BAUD_RATE);
+}
+
+static esp_err_t i2c_master_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+
+    esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_ZS11, "i2c_param_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_ZS11, "i2c_driver_install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+static void mux_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BANK_SEL) | (1ULL << SEL0) |
+                        (1ULL << SEL1) | (1ULL << SEL2) | (1ULL << SEL3),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+}
+
+static void select_channel(int bank, int channel, bool group1) {
+    gpio_set_level(BANK_SEL, bank);
+    if (group1) {
+        gpio_set_level(SEL2, channel & 0x01);
+        gpio_set_level(SEL3, (channel >> 1) & 0x01);
+        gpio_set_level(SEL0, 0);
+        gpio_set_level(SEL1, 0);
+    } else {
+        gpio_set_level(SEL0, channel & 0x01);
+        gpio_set_level(SEL1, (channel >> 1) & 0x01);
+        gpio_set_level(SEL2, 0);
+        gpio_set_level(SEL3, 0);
+    }
+    vTaskDelay(pdMS_TO_TICKS(SETTLE_MS));
+}
+
+static uint8_t ze_checksum(uint8_t *data) {
+    uint8_t sum = 0;
+    for (int i = 1; i < 8; i++) sum += data[i];
+    return (uint8_t)(~sum + 1);
+}
+
+static uint8_t mhz19c_checksum(uint8_t *packet) {
+    uint8_t sum = 0;
+    for (int i = 1; i < 8; i++) sum += packet[i];
+    return (uint8_t)(0xFF - sum + 1);
+}
+
+static void benzene_adc_init(void) {
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = { .atten = ADC_ATTEN, .bitwidth = ADC_WIDTH };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL, &chan_cfg));
+    ESP_LOGI(TAG_BENZENE, "ADC initialized on channel %d", ADC_CHANNEL);
+}
+
+static float read_benzene_sensor(void) {
+    int raw = 0;
+    int total_raw = 0;
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL, &raw));
+        total_raw += raw;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    int avg_raw = total_raw / NUM_SAMPLES;
+    float voltage = ((float)avg_raw / 4095.0f) * SENSOR_VREF;
+    voltage -= BIAS_VOLTAGE;
+
+    if (voltage < 0) voltage = 0;
+    if (voltage > 2.0f) voltage = 2.0f;
+
+    float ppm = (voltage * 100.0f) / 2.0f;
+    if (ppm > 500) ppm = 500;
+
+    ESP_LOGI(TAG_BENZENE, "Benzene: raw=%d, voltage=%.2f V -> ppm=%.2f", avg_raw, voltage, ppm);
+    return ppm;
+}
+
+// ZS11 Temperature & Humidity Sensor Functions
+static esp_err_t zs11_cmd_init(void) {
+    uint8_t cmd[3] = { 0xBE, 0x08, 0x00 };
+    return i2c_master_write_to_device(I2C_MASTER_NUM, ZS11_SENSOR_ADDR, cmd, sizeof(cmd), pdMS_TO_TICKS(100));
+}
+
+static esp_err_t zs11_cmd_trigger_measure(void) {
+    uint8_t cmd[3] = { 0xAC, 0x33, 0x00 };
+    return i2c_master_write_to_device(I2C_MASTER_NUM, ZS11_SENSOR_ADDR, cmd, sizeof(cmd), pdMS_TO_TICKS(100));
+}
+
+static esp_err_t zs11_read_status(uint8_t *status) {
+    uint8_t cmd = 0x71;
+    esp_err_t ret = i2c_master_write_to_device(I2C_MASTER_NUM, ZS11_SENSOR_ADDR, &cmd, 1, pdMS_TO_TICKS(50));
+    if (ret != ESP_OK) return ret;
+    return i2c_master_read_from_device(I2C_MASTER_NUM, ZS11_SENSOR_ADDR, status, 1, pdMS_TO_TICKS(50));
+}
+
+static esp_err_t zs11_read_measurement(uint8_t *buf6) {
+    return i2c_master_read_from_device(I2C_MASTER_NUM, ZS11_SENSOR_ADDR, buf6, 6, pdMS_TO_TICKS(100));
+}
+
+static bool zs11_decode(const uint8_t *b, float *out_t, float *out_rh) {
+    uint8_t status = b[0];
+    bool busy = (status & 0x80) != 0;
+    bool cal  = (status & 0x08) != 0;
+
+    ESP_LOGI(TAG_ZS11, "Status: 0x%02X (busy=%d, cal=%d)", status, busy, cal);
+    if (busy) return false;
+
+    uint32_t raw_h = ((uint32_t)b[1] << 12) | ((uint32_t)b[2] << 4) | (b[3] >> 4);
+    uint32_t raw_t = (((uint32_t)(b[3] & 0x0F) << 16) | ((uint32_t)b[4] << 8) | b[5]);
+
+    *out_rh = (raw_h * 100.0f) / 1048576.0f;
+    *out_t  = (raw_t * 200.0f) / 1048576.0f - 50.0f;
+    (void)cal;
+    return true;
+}
+
+static int read_temp_humidity_zs11(float *temperature, float *humidity) {
+    esp_err_t ret;
+    
+    ret = zs11_cmd_trigger_measure();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_ZS11, "Trigger failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+
+    bool ready = false;
+    for (int i = 0; i < 15; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        uint8_t status;
+        if (zs11_read_status(&status) == ESP_OK) {
+            if ((status & 0x80) == 0) {
+                ready = true;
+                break;
+            }
+        }
+    }
+    
+    if (!ready) {
+        ESP_LOGE(TAG_ZS11, "Measurement not ready (still busy)");
+        return -1;
+    }
+
+    uint8_t buf[6] = {0};
+    ret = zs11_read_measurement(buf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_ZS11, "Read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+
+    if (zs11_decode(buf, temperature, humidity)) {
+        ESP_LOGI(TAG_ZS11, "Temperature: %.2f °C | Humidity: %.2f %%RH", *temperature, *humidity);
+        return 0;
+    } else {
+        ESP_LOGE(TAG_ZS11, "Failed to decode ZS11 data");
+        *temperature = -1.0f;
+        *humidity = -1.0f;
+        return -1;
+    }
+}
+
+static void initialize_zs11_sensor(void) {
+    ESP_LOGI(TAG_ZS11, "Initializing ZS11 sensor...");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uint8_t st = 0;
+    if (zs11_read_status(&st) == ESP_OK) {
+        bool cal = (st & 0x08) != 0;
+        if (!cal) {
+            ESP_LOGW(TAG_ZS11, "CAL bit is 0 (not calibrated). Sending init (0xBE 0x08 0x00)...");
+            esp_err_t r = zs11_cmd_init();
+            if (r != ESP_OK) {
+                ESP_LOGW(TAG_ZS11, "Init command failed: %s", esp_err_to_name(r));
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else {
+            ESP_LOGI(TAG_ZS11, "ZS11 sensor is calibrated and ready");
+        }
+    } else {
+        ESP_LOGW(TAG_ZS11, "Could not read status on startup; continuing.");
+    }
+}
+
+// PM Sensor Implementation
+static int read_pm_sensor_improved(int bank, int channel, float *pm2_5, float *pm10) {
+    select_channel(bank, channel, true);
+    uart_flush(SENSOR_UART_PORT);
+
+    uint8_t pm_cmd[] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uart_write_bytes(SENSOR_UART_PORT, (const char*)pm_cmd, sizeof(pm_cmd));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    uint8_t pm_response[9] = {0};
+    int len = uart_read_bytes(SENSOR_UART_PORT, pm_response, 9, pdMS_TO_TICKS(1000));
+    
+    if (len == 9 && pm_response[0] == 0xFF && pm_response[1] == 0x86) {
+        uint8_t checksum = 0;
+        for (int i = 1; i < 8; i++) {
+            checksum += pm_response[i];
+        }
+        checksum = ~checksum + 1;
+        
+        if (checksum == pm_response[8]) {
+            uint16_t pm25_raw = (pm_response[2] << 8) | pm_response[3];
+            uint16_t pm10_raw = (pm_response[4] << 8) | pm_response[5];
+            
+            *pm2_5 = pm25_raw * 0.1f;
+            *pm10 = pm10_raw * 0.1f;
+            
+            ESP_LOGI(TAG_PM, "PM Sensor (Bank %d, Channel %d) → PM2.5: %.1f µg/m³, PM10: %.1f µg/m³", 
+                     bank, channel, *pm2_5, *pm10);
+            return 0;
+        }
+    }
+    
+    *pm2_5 = -1.0f;
+    *pm10 = -1.0f;
+    return -1;
+}
+
+// Noise Sensor Implementation
+static uint16_t modbus_crc(uint8_t *buf, int len) {
+    uint16_t crc = 0xFFFF;
+    for (int pos = 0; pos < len; pos++) {
+        crc ^= (uint16_t)buf[pos];
+        for (int i = 0; i < 8; i++) {
+            if (crc & 0x0001) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+static float read_noise_sensor(int bank, int channel) {
+    select_channel(bank, channel, true);
+    uart_flush(SENSOR_UART_PORT);
+
+    uint8_t req[] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A };
+    uart_write_bytes(SENSOR_UART_PORT, (const char*)req, sizeof(req));
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    uint8_t rxbuf[BUF_SIZE] = { 0 };
+    int len = uart_read_bytes(SENSOR_UART_PORT, rxbuf, BUF_SIZE, pdMS_TO_TICKS(500));
+    if (len > 0) {
+        if (len >= 7) {
+            uint16_t crc_calc = modbus_crc(rxbuf, len - 2);
+            uint16_t crc_recv = rxbuf[len - 2] | (rxbuf[len - 1] << 8);
+            if (crc_calc == crc_recv && rxbuf[1] == 0x03) {
+                uint16_t value = (rxbuf[3] << 8) | rxbuf[4];
+                float dB = value / 10.0f;
+                ESP_LOGI(TAG_NOISE, "Noise Level = %.1f dB", dB);
+                return dB;
+            }
+        }
+    }
+    return -1.0f;
+}
+
+// SO2 Sensor Implementation
+static uint8_t ze03_calculate_checksum(uint8_t *data)
+{
+    uint8_t sum = 0;
+    for (int i = 1; i < 8; i++) sum += data[i];
+    return (uint8_t)(~sum + 1);
+}
+
+static float read_so2_sensor_improved(int bank, int channel) {
+    uint8_t request_cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t response[9] = {0};
+
+    select_channel(bank, channel, true);
+    uart_flush(SENSOR_UART_PORT);
+    
+    // Clear any pending data
+    uint8_t dummy[32];
+    while (uart_read_bytes(SENSOR_UART_PORT, dummy, sizeof(dummy), pdMS_TO_TICKS(100)) > 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // Send command
+    int written = uart_write_bytes(SENSOR_UART_PORT, (const char*)request_cmd, sizeof(request_cmd));
+    if (written != sizeof(request_cmd)) {
+        return -1.0f;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // Read response
+    int len = uart_read_bytes(SENSOR_UART_PORT, response, 9, pdMS_TO_TICKS(1000));
+    
+    if (len == 9 && response[0] == 0xFF && response[1] == 0x86) {
+        uint8_t checksum = ze03_calculate_checksum(response);
+        if (checksum == response[8]) {
+            uint16_t raw = (response[2] << 8) | response[3];
+            float ppb = raw * 10.0f;
+            // Convert SO2 from ppb to µg/m³ for DOH
+            float so2_ugm3 = ppb * 2.66f;
+            ESP_LOGI(TAG_SO2, "SO₂ (Bank %d Ch %d) → %.1f ppb -> %.1f µg/m³", bank, channel, ppb, so2_ugm3);
+            return so2_ugm3;
+        }
+    }
+    
+    return -1.0f;
+}
+
+// NO2 Sensor Implementation
+static float read_no2_sensor_improved(int bank, int channel) {
+    uint8_t request_cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t response[9];
+
+    select_channel(bank, channel, false);
+    uart_flush(SENSOR_UART_PORT);
+    uart_write_bytes(SENSOR_UART_PORT, (const char*)request_cmd, sizeof(request_cmd));
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    int len = uart_read_bytes(SENSOR_UART_PORT, response, 9, pdMS_TO_TICKS(1000));
+    if (len == 9 && response[0] == 0xFF && response[1] == 0x86) {
+        uint8_t checksum = ze03_calculate_checksum(response);
+        if (checksum == response[8]) {
+            uint16_t raw = (response[2] << 8) | response[3];
+            float ppb = raw * 10.0f;
+            float no2_ugm3 = ppb * 1.88f;
+            ESP_LOGI(TAG_NO2, "NO₂ (Bank %d, Channel %d) → %.1f ppb -> %.1f µg/m³", bank, channel, ppb, no2_ugm3);
+            return no2_ugm3;
+        }
+    }
+    return -1.0f;
+}
+
+// CH2O Sensor Implementation
+static uint8_t ze07_calculate_checksum(uint8_t *data) {
+    uint8_t sum = 0;
+    for (int i = 1; i < 8; i++) sum += data[i];
+    return (uint8_t)(~sum + 1);
+}
+
+static float read_ch2o_sensor_improved(int bank, int channel) {
+    uint8_t request_cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t response[9];
+
+    select_channel(bank, channel, true);
+    uart_flush(SENSOR_UART_PORT);
+    uart_write_bytes(SENSOR_UART_PORT, (const char*)request_cmd, sizeof(request_cmd));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    int len = uart_read_bytes(SENSOR_UART_PORT, response, 9, pdMS_TO_TICKS(1000));
+    if (len == 9 && response[0] == 0xFF && response[1] == 0x86) {
+        uint8_t checksum = ze07_calculate_checksum(response);
+        if (checksum == response[8]) {
+            uint16_t ppb = (response[6] << 8) | response[7];
+            float ch2o_ugm3 = ppb * 1.23f;
+            ESP_LOGI(TAG_CH2O, "CH₂O (Bank %d, Channel %d): %d ppb -> %.1f µg/m³", bank, channel, ppb, ch2o_ugm3);
+            return ch2o_ugm3;
+        }
+    }
+    return -1.0f;
+}
+
+// O3 Sensor Implementation
+static float read_o3_sensor_improved(int bank, int channel) {
+    select_channel(bank, channel, false);
+    uart_flush(SENSOR_UART_PORT);
+    
+    uint8_t response[9] = {0};
+    int len = uart_read_bytes(SENSOR_UART_PORT, response, 9, pdMS_TO_TICKS(1000));
+    
+    if (len == 9 && response[0] == 0xFF && response[1] == 0x2A) {
+        uint16_t ppb = (response[4] << 8) | response[5];
+        float o3_ugm3 = ppb * 1.96f;
+        ESP_LOGI(TAG_O3, "O₃ (Bank %d Ch %d) → %u ppb -> %.1f µg/m³", bank, channel, ppb, o3_ugm3);
+        return o3_ugm3;
+    } else {
+        uint8_t cmd[9] = { 0xFF, 0x01, 0x86, 0,0,0,0,0, 0x79 };
+        uint8_t resp[9] = {0};
+        
+        uart_write_bytes(SENSOR_UART_PORT, (const char*)cmd, sizeof(cmd));
+        vTaskDelay(pdMS_TO_TICKS(300));
+        
+        len = uart_read_bytes(SENSOR_UART_PORT, resp, 9, pdMS_TO_TICKS(1000));
+        if (len == 9 && resp[0] == 0xFF && resp[1] == 0x86) {
+            if (ze_checksum(resp) == resp[8]) {
+                uint16_t raw = (resp[2] << 8) | resp[3];
+                float ppm = raw * 0.001f;
+                float o3_ugm3 = ppm * 1960.0f;
+                ESP_LOGI(TAG_O3, "O₃ (Bank %d Ch %d) → %.3f ppm -> %.1f µg/m³", bank, channel, ppm, o3_ugm3);	
+                return o3_ugm3;
+            }
+        }
+    }
+    
+    return -1.0f;
+}
+
+// CO Sensor Implementation
+static float read_co_sensor_improved(int bank, int channel) {
+    uint8_t cmd[9] = { 0xFF, 0x01, 0x86, 0,0,0,0,0, 0x79 };
+    uint8_t resp[9] = { 0 };
+
+    select_channel(bank, channel, false);
+    uart_flush(SENSOR_UART_PORT);
+    
+    // Clear any pending data first
+    uint8_t dummy[32];
+    while (uart_read_bytes(SENSOR_UART_PORT, dummy, sizeof(dummy), pdMS_TO_TICKS(100)) > 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    int written = uart_write_bytes(SENSOR_UART_PORT, (const char*)cmd, sizeof(cmd));
+    if (written != sizeof(cmd)) {
+        ESP_LOGE(TAG_CO, "Failed to write CO command");
+        return -1.0f;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500)); // Increased delay for CO sensor
+
+    int len = uart_read_bytes(SENSOR_UART_PORT, resp, 9, pdMS_TO_TICKS(1500)); // Increased timeout
+    if (len != 9 || resp[0] != 0xFF || resp[1] != 0x86) {
+        ESP_LOGE(TAG_CO, "Invalid CO response: len=%d, header=0x%02X 0x%02X", len, resp[0], resp[1]);
+        return -1.0f;
+    }
+
+    if (ze_checksum(resp) != resp[8]) {
+        ESP_LOGE(TAG_CO, "CO checksum failed: expected 0x%02X, got 0x%02X", ze_checksum(resp), resp[8]);
+        return -1.0f;
+    }
+
+    uint16_t raw = (resp[2] << 8) | resp[3];
+    float ppm = raw * 0.1f;
+    
+    // CORRECT CO conversion from ppm to mg/m³
+    // Conversion factor for CO: 1 ppm = 1.145 mg/m³ at 25°C and 1013.25 hPa
+    float co_mgm3 = ppm * 1.145f;
+    
+    // Validate CO reading range
+    if (ppm < 0 || ppm > 1000) { // Reasonable range for CO
+        ESP_LOGW(TAG_CO, "CO reading out of range: %.1f ppm", ppm);
+        return -1.0f;
+    }
+    
+    ESP_LOGI(TAG_CO, "CO (Bank %d Ch %d) → Raw: %d, %.1f ppm -> %.3f mg/m³", bank, channel, raw, ppm, co_mgm3);
+    return co_mgm3;
+}
+
+// CO2 Sensor Implementation
+static float read_co2_sensor(int bank, int channel) {
+    uint8_t cmd[9] = { 0xFF, 0x01, 0x86, 0,0,0,0,0, 0x79 };
+    uint8_t resp[9] = { 0 };
+
+    select_channel(bank, channel, false);
+    uart_flush(SENSOR_UART_PORT);
+    uart_write_bytes(SENSOR_UART_PORT, (const char*)cmd, sizeof(cmd));
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    int len = uart_read_bytes(SENSOR_UART_PORT, resp, 9, pdMS_TO_TICKS(1000));
+    if (len != 9 || resp[0] != 0xFF || resp[1] != 0x86) {
+        return -1.0f;
+    }
+
+    if (mhz19c_checksum(resp) != resp[8]) {
+        return -1.0f;
+    }
+
+    uint16_t co2ppm = (resp[2] << 8) | resp[3];
+    ESP_LOGI(TAG, "MH-Z19C (Bank %d Ch %d) → CO2: %d ppm", bank, channel, co2ppm);
+    return (float)co2ppm;
+}
+
+// VOC Sensor Implementation
+static void init_voc_gpio() {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << VOC_SENSOR_PIN_A) | (1ULL << VOC_SENSOR_PIN_B),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE
+    };
+    gpio_config(&io_conf);
+}
+
+static int get_pollution_class(bool A, bool B) {
+    if (!A && !B) return 0;
+    if (!A &&  B) return 1;
+    if ( A && !B) return 2;
+    if ( A &&  B) return 3;
+    return -1;
+}
+
+static float read_voc_sensor(void) {
+    int a_val = gpio_get_level(VOC_SENSOR_PIN_A);
+    int b_val = gpio_get_level(VOC_SENSOR_PIN_B);
+
+    int pollution_class = get_pollution_class(a_val, b_val);
+
+    ESP_LOGI(TAG_VOC, "Digital A = %d | Digital B = %d → Pollution Class = %d",
+               a_val, b_val, pollution_class);
+
+    return (float)pollution_class;
+}
+
+// ========================
+// ===== OFFSET FUNCTIONS =====
+// ========================
+
+static const char* get_sensor_id_from_param(const char* param_name) {
+    for (int i = 0; i < g_param_mapping_count; i++) {
+        if (strcmp(g_param_mapping[i].param_name, param_name) == 0) {
+            return g_param_mapping[i].sensor_id;
+        }
+    }
+    return NULL;
+}
+
+static void parse_offsets_from_wifi(cJSON *offsets_array) {
+    g_offset_count = 0;
+    
+    if (!cJSON_IsArray(offsets_array)) {
+        return;
+    }
+    
+    ESP_LOGI(TAG, "=== PARSING OFFSETS FROM WIFI ===");
+    
+    cJSON *offset_item = NULL;
+    cJSON_ArrayForEach(offset_item, offsets_array) {
+        if (g_offset_count >= 20) {
+            break;
+        }
+        
+        const char *param_name = NULL;
+        cJSON *param_json = cJSON_GetObjectItem(offset_item, "param");
+        if (cJSON_IsString(param_json)) {
+            param_name = param_json->valuestring;
+        }
+        
+        if (param_name) {
+            const char *sensor_id = get_sensor_id_from_param(param_name);
+            if (sensor_id) {
+                strncpy(g_offsets[g_offset_count].parameter_id, sensor_id, 
+                       sizeof(g_offsets[g_offset_count].parameter_id)-1);
+                
+                g_offsets[g_offset_count].x_offset = cJSON_GetNumberValue(cJSON_GetObjectItem(offset_item, "x"));
+                g_offsets[g_offset_count].y_offset = cJSON_GetNumberValue(cJSON_GetObjectItem(offset_item, "y"));
+                
+                const char* description = "";
+                const char* unit = "";
+                for (int i = 0; i < g_param_mapping_count; i++) {
+                    if (strcmp(g_param_mapping[i].param_name, param_name) == 0) {
+                        description = g_param_mapping[i].description;
+                        unit = g_param_mapping[i].unit;
+                        break;
+                    }
+                }
+                
+                ESP_LOGI(TAG, "OFFSET CONFIGURED: %s (%s) -> X:%.2f, Y:%.2f [%s %s]", 
+                        param_name, sensor_id,
+                        g_offsets[g_offset_count].x_offset,
+                        g_offsets[g_offset_count].y_offset,
+                        description, unit);
+                
+                g_offset_count++;
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Total offsets parsed: %d", g_offset_count);
+    
+    if (g_offset_count == 0) {
+        ESP_LOGW(TAG, "No valid offsets configured - using raw sensor values");
+    }
+}
+
+static float apply_offset_calculation(const char *sensor_id, float raw_value) {
+    if (isnan(raw_value) || raw_value < 0) {
+        return NAN;
+    }
+    
+    if (g_offset_count == 0) {
+        return raw_value;
+    }
+    
+    for (int i = 0; i < g_offset_count; i++) {
+        if (strcmp(g_offsets[i].parameter_id, sensor_id) == 0) {
+            float x_offset = g_offsets[i].x_offset;
+            float y_offset = g_offsets[i].y_offset;
+            
+            float adjusted_value = (raw_value * x_offset) + y_offset;
+            
+            const char* param_name = "Unknown";
+            const char* description = "";
+            const char* unit = "";
+            for (int j = 0; j < g_param_mapping_count; j++) {
+                if (strcmp(g_param_mapping[j].sensor_id, sensor_id) == 0) {
+                    param_name = g_param_mapping[j].param_name;
+                    description = g_param_mapping[j].description;
+                    unit = g_param_mapping[j].unit;
+                    break;
+                }
+            }
+            
+            ESP_LOGI(TAG, "OFFSET APPLIED: %s (%s) - Raw: %.2f -> Adjusted: %.2f (X:%.2f, Y:%.2f) [%s %s]", 
+                    param_name, sensor_id, raw_value, adjusted_value, x_offset, y_offset, description, unit);
+            
+            return adjusted_value;
+        }
+    }
+    
+    return raw_value;
+}
+
+// ========================
+// ===== COMPLETE SENSOR READING WITH AQI =====
+// ========================
+
+static void read_all_sensors_complete(sensor_data_t *data) {
+    ESP_LOGI(TAG, "=== STARTING COMPLETE SENSOR READING ===");
+    
+    memset(data, 0, sizeof(sensor_data_t));
+    data->data_valid = false;
+    
+    // Get current time
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    data->timestamp = now;
+    strftime(data->timestamp_str, sizeof(data->timestamp_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    
+    ESP_LOGI(TAG, "Sensor reading started at: %s", data->timestamp_str);
+    
+    // Read all sensors in sequence
+    ESP_LOGI(TAG, "1. Reading Noise Sensor (Bank 0, Channel 1)...");
+    data->noise = read_noise_sensor(0, 1);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "2. Reading CH2O Sensor ZE07 (Bank 0, Channel 0)...");
+    data->ch2o = read_ch2o_sensor_improved(0, 0);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "3. Reading SO2 Sensor (Bank 0, Channel 2)...");
+    data->so2 = read_so2_sensor_improved(0, 2);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "4. Reading NO2 Sensor (Bank 1, Channel 0)...");
+    data->no2 = read_no2_sensor_improved(1, 0);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "5. Reading O3 Sensor (Bank 1, Channel 3)...");
+    data->o3 = read_o3_sensor_improved(1, 3);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "6. Reading CO2 Sensor MH-Z19C (Bank 1, Channel 2)...");
+    data->co2 = read_co2_sensor(1, 2);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "7. Reading VOC Sensor...");
+    data->voc = read_voc_sensor();
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "8. Reading Benzene Sensor...");
+    data->benzene = read_benzene_sensor();
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "9. Reading PM Sensor (Bank 0, Channel 3)...");
+    float pm2_5, pm10;
+    if (read_pm_sensor_improved(0, 3, &pm2_5, &pm10) == 0) {
+        data->pm2_5 = pm2_5;
+        data->pm10 = pm10;
+        ESP_LOGI(TAG, "PM2.5: %.1f µg/m³, PM10: %.1f µg/m³", data->pm2_5, data->pm10);
+    } else {
+        data->pm2_5 = -1.0f;
+        data->pm10 = -1.0f;
+    }
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "10. Reading CO Sensor (Bank 1, Channel 1)...");
+    data->co = read_co_sensor_improved(1, 1);
+    vTaskDelay(pdMS_TO_TICKS(READ_DELAY_MS));
+
+    ESP_LOGI(TAG, "11. Reading Temperature & Humidity Sensor (ZS11)...");
+    if (read_temp_humidity_zs11(&data->temperature, &data->humidity) != 0) {
+        data->temperature = -1.0f;
+        data->humidity = -1.0f;
+    } else {
+        ESP_LOGI(TAG, "Temperature: %.2f ℃, Humidity: %.2f %%", data->temperature, data->humidity);
+    }
+
+    // Calculate AQI using OFFSET-ADJUSTED values
+    ESP_LOGI(TAG, "12. Calculating UAE AQI with OFFSET-ADJUSTED values...");
+    
+    // Apply offsets to get adjusted values for AQI calculation
+    float adjusted_pm2_5 = apply_offset_calculation("5a54b202f1c20", data->pm2_5);
+    float adjusted_pm10 = apply_offset_calculation("5a65aeaa75285", data->pm10);
+    float adjusted_no2 = apply_offset_calculation("5beea162da446", data->no2);
+    float adjusted_so2 = apply_offset_calculation("so2", data->so2);
+    float adjusted_co = apply_offset_calculation("5bd02649d73f9", data->co);
+    float adjusted_o3 = apply_offset_calculation("59c10c1d8d49f", data->o3);
+    
+    // Use adjusted values for AQI calculation
+    aqi_result_t aqi_result = aqi_uae_compute_raw(
+        adjusted_pm2_5,
+        adjusted_pm10,  
+        adjusted_no2,
+        adjusted_so2,
+        adjusted_co,
+        adjusted_o3
+    );
+    
+    data->aqi = aqi_result.aqi;
+    data->aqi_band = aqi_result.label;
+    data->dominant_pollutant = aqi_result.dominant_pollutant;
+    
+    ESP_LOGI(TAG, "=== AQI CALCULATION DETAILS ===");
+    ESP_LOGI(TAG, "PM2.5: Raw=%.1f, Adjusted=%.1f µg/m³", data->pm2_5, adjusted_pm2_5);
+    ESP_LOGI(TAG, "PM10: Raw=%.1f, Adjusted=%.1f µg/m³", data->pm10, adjusted_pm10);
+    ESP_LOGI(TAG, "NO2: Raw=%.1f, Adjusted=%.1f µg/m³", data->no2, adjusted_no2);
+    ESP_LOGI(TAG, "SO2: Raw=%.1f, Adjusted=%.1f µg/m³", data->so2, adjusted_so2);
+    ESP_LOGI(TAG, "CO: Raw=%.3f, Adjusted=%.3f mg/m³", data->co, adjusted_co);
+    ESP_LOGI(TAG, "O3: Raw=%.1f, Adjusted=%.1f µg/m³", data->o3, adjusted_o3);
+    ESP_LOGI(TAG, "UAE AQI: %d (%s)", data->aqi, data->aqi_band);
+    ESP_LOGI(TAG, "Dominant Pollutant: %s", data->dominant_pollutant);
+    ESP_LOGI(TAG, "=================================");
+
+    data->data_valid = true;
+    
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char end_time_str[64];
+    strftime(end_time_str, sizeof(end_time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    
+    ESP_LOGI(TAG, "=== COMPLETE SENSOR READING FINISHED ===");
+    ESP_LOGI(TAG, "Reading started at: %s", data->timestamp_str);
+    ESP_LOGI(TAG, "Reading finished at: %s", end_time_str);
+}
+
+// ========================
+// ===== UART DATA SEND TO ESP32-S3 WITH AQI =====
+// ========================
+
+static void send_sensor_data_via_uart(sensor_data_t *data) {
+    char buffer[512];
+    
+    // ✅ Use the window timestamp from the data structure
+    char current_time_str[64];
+    strncpy(current_time_str, data->timestamp_str, sizeof(current_time_str));
+    
+    int wifi_status_int = wifi_active ? 1 : 0;
+    bool current_internet_status = quick_internet_check();
+    int internet_status_int = current_internet_status ? 1 : 0;
+    
+    // Apply offsets for UART transmission
+    float uart_pm2_5 = apply_offset_calculation("5a54b202f1c20", data->pm2_5);
+    float uart_pm10 = apply_offset_calculation("5a65aeaa75285", data->pm10);
+    float uart_co = apply_offset_calculation("5bd02649d73f9", data->co);
+    float uart_o3 = apply_offset_calculation("59c10c1d8d49f", data->o3);
+    float uart_no2 = apply_offset_calculation("5beea162da446", data->no2);
+    float uart_co2 = apply_offset_calculation("59c10c1d8cffb", data->co2);
+    float uart_voc = apply_offset_calculation("59d787bc91133", data->voc);
+    float uart_ch2o = apply_offset_calculation("5be03cbe9f8e9", data->ch2o);
+    float uart_temp = apply_offset_calculation("5a65ae47024f8", data->temperature);
+    float uart_hum = apply_offset_calculation("5bd7065cb9d49", data->humidity);
+    float uart_noise = apply_offset_calculation("noise", data->noise);
+    float uart_benzene = apply_offset_calculation("benzene", data->benzene);
+    float uart_so2 = apply_offset_calculation("so2", data->so2);
+    
+    // ✅ Build the UART string piece by piece with "nan" for invalid values
+    int offset = 0;
+    
+    // Start with fixed fields
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset,
+                      "AQI_STATUS=%d,WIFI_STATUS=%d,INTERNET_STATUS=%d,",
+                      data->aqi, wifi_status_int, internet_status_int);
+    
+    // Add sensor fields with "nan" for invalid values
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "PM2_5=");
+    if (!isnan(uart_pm2_5) && uart_pm2_5 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_pm2_5);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",PM10=");
+    if (!isnan(uart_pm10) && uart_pm10 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_pm10);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",CO=");
+    if (!isnan(uart_co) && uart_co >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.3f", uart_co);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",O3=");
+    if (!isnan(uart_o3) && uart_o3 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_o3);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",NO2=");
+    if (!isnan(uart_no2) && uart_no2 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_no2);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",CO2=");
+    if (!isnan(uart_co2) && uart_co2 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_co2);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",VOC=");
+    if (!isnan(uart_voc) && uart_voc >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_voc);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",CH2O=");
+    if (!isnan(uart_ch2o) && uart_ch2o >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_ch2o);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",TEMP=");
+    if (!isnan(uart_temp) && uart_temp >= -40) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.2f", uart_temp);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",HUM=");
+    if (!isnan(uart_hum) && uart_hum >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.2f", uart_hum);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",NOISE=");
+    if (!isnan(uart_noise) && uart_noise >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_noise);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",C6H6=");
+    if (!isnan(uart_benzene) && uart_benzene >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.2f", uart_benzene);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",SO2=");
+    if (!isnan(uart_so2) && uart_so2 >= 0) {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%.1f", uart_so2);
+    } else {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "nan");
+    }
+    
+    // Add the timestamp
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",TIME=%s\n", current_time_str);
+    
+    int bytes_sent = uart_write_bytes(DATA_UART_PORT, buffer, strlen(buffer));
+    
+    // ✅ ADD DETAILED LOGGING
+    ESP_LOGI(TAG, "=== SENDING 5-MIN AVERAGED DATA TO ESP32-S3 ===");
+    ESP_LOGI(TAG, "Window Time: %s", current_time_str);
+    ESP_LOGI(TAG, "AQI Status: %d (5-MIN AVERAGE)", data->aqi);
+    ESP_LOGI(TAG, "WiFi Status: %d", wifi_status_int);
+    ESP_LOGI(TAG, "Internet Status: %d", internet_status_int);
+    ESP_LOGI(TAG, "=== UART OUTPUT STRING ===");
+    ESP_LOGI(TAG, "%s", buffer);
+    ESP_LOGI(TAG, "Sent %d bytes", bytes_sent);
+    ESP_LOGI(TAG, "=== 5-MIN AVERAGED DATA SENT ===");
+}
+
+// ========================
+// ===== INTERNET CHECK FUNCTIONS =====
+// ========================
+
+static bool check_internet_simple_tcp(void) {
+    ESP_LOGI(TAG, "🔍 Checking internet via TCP connection to 8.8.8.8:53...");
+    
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr("8.8.8.8");
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(53); // DNS port
+    
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Failed to create socket");
+        return false;
+    }
+    
+    // Set socket timeout to 5 seconds
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    int result = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    close(sock);
+    
+    if (result == 0) {
+        ESP_LOGI(TAG, "✅ Internet connectivity confirmed (TCP to 8.8.8.8)");
+        return true;
+    } else {
+        ESP_LOGW(TAG, "❌ No internet (TCP connection failed)");
+        return false;
+    }
+}
+
+static bool check_internet_connectivity_comprehensive(void) {
+    ESP_LOGI(TAG, "=== INTERNET CONNECTIVITY CHECK ===");
+    
+    // Try TCP connection first (most reliable)
+    if (check_internet_simple_tcp()) {
+        internet_available = true;
+        ESP_LOGI(TAG, "✅✅✅ INTERNET: FULLY AVAILABLE");
+        return true;
+    }
+    
+    // TCP failed - no internet
+    internet_available = false;
+    strcpy(esp32_public_ip, "0.0.0.0");
+    ESP_LOGI(TAG, "❌❌❌ INTERNET: NOT AVAILABLE");
+    
+    return false;
+}
+
+static bool quick_internet_check(void) {
+    // Use TCP method for quick check (faster than HTTP)
+    return check_internet_simple_tcp();
+}
+
+// ========================
+// ===== NETWORK & WIFI FUNCTIONS =====
+// ========================
+
+static void get_network_info(void) {
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(esp32_mac, sizeof(esp32_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        snprintf(esp32_private_ip, sizeof(esp32_private_ip), IPSTR, IP2STR(&ip_info.ip));
+    }
+    
+    // Check internet connectivity using simple TCP method
+    if (wifi_active) {
+        internet_available = quick_internet_check();
+    } else {
+        internet_available = false;
+    }
+    
+    ESP_LOGI(TAG, "=== NETWORK INFORMATION ===");
+    ESP_LOGI(TAG, "MAC Address: %s", esp32_mac);
+   // ESP_LOGI(TAG, "Private IP: %s", esp32_private_ip);
+    ESP_LOGI(TAG, "Public IP: %s", esp32_public_ip);  // Now shows actual public IP
+    ESP_LOGI(TAG, "WiFi Status: %s", wifi_active ? "CONNECTED" : "DISCONNECTED");
+    ESP_LOGI(TAG, "Internet Available: %s", internet_available ? "YES" : "NO");
+    ESP_LOGI(TAG, "===========================");
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+            esp_wifi_connect();
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+            wifi_active = false;
+            internet_available = false;
+            strcpy(esp32_public_ip, "0.0.0.0");  // Reset public IP on disconnect
+            
+            if (s_retry_num < MAX_RETRY) {
+                s_retry_num++;
+                ESP_LOGI(TAG, "WiFi disconnected, retrying... (%d/%d)", s_retry_num, MAX_RETRY);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGI(TAG, "WiFi connection failed after %d attempts", MAX_RETRY);
+                xEventGroupSetBits(s_evt_group, WIFI_FAIL_BIT);
+            }
+            break;
+        case WIFI_EVENT_AP_START:
+            ESP_LOGI(TAG, "WIFI_EVENT_AP_START - AP Name: %s", wifi_ap_ssid);
+            break;
+        case WIFI_EVENT_AP_STOP:
+            ESP_LOGI(TAG, "WIFI_EVENT_AP_STOP");
+            break;
+        default:
+            break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "✅ Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        snprintf(esp32_private_ip, sizeof(esp32_private_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        
+        s_retry_num = 0;
+        wifi_active = true;
+        
+        // Wait a moment then check internet connectivity and get public IP
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        get_network_info();
+        
+        // Update public IP after WiFi connection is established
+        update_public_ip_on_wifi_connect();
+        
+        xEventGroupSetBits(s_evt_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void update_ap_name_with_device_id(void) {
+    if (strlen(device_id) > 0) {
+        char safe_device_id[27];
+        strncpy(safe_device_id, device_id, sizeof(safe_device_id) - 1);
+        safe_device_id[sizeof(safe_device_id) - 1] = '\0';
+        
+        snprintf(wifi_ap_ssid, sizeof(wifi_ap_ssid), "IAQ_%s", safe_device_id);
+        ESP_LOGI(TAG, "Updated AP name from IAQ_ to: %s", wifi_ap_ssid);
+        
+        wifi_config_t ap_config = {
+            .ap = {
+                .ssid = "",
+                .ssid_len = 0,
+                .channel = WIFI_AP_CHANNEL,
+                .password = WIFI_AP_PASS,
+                .max_connection = MAX_STA_CONN,
+                .authmode = WIFI_AUTH_OPEN
+            },
+        };
+        strncpy((char*)ap_config.ap.ssid, wifi_ap_ssid, sizeof(ap_config.ap.ssid)-1);
+        ap_config.ap.ssid_len = strlen(wifi_ap_ssid);
+        
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        ESP_LOGI(TAG, "AP restarted with new name: %s", wifi_ap_ssid);
+    }
+}
+
+static void initialize_mdns(void) {
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        return;
+    }
+    
+    mdns_hostname_set("esp32");
+    mdns_instance_name_set("AQI Environmental Monitor");
+    
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    
+    mdns_txt_item_t serviceTxtData[3] = {
+        {"device", "aqi-monitor"},
+        {"version", "1.0"},
+        {"api", "/wifi"}
+    };
+    mdns_service_txt_set("_http", "_tcp", serviceTxtData, 3);
+    
+    ESP_LOGI(TAG, "mDNS Service Started: http://esp32.local");
+    ESP_LOGI(TAG, "Provisioning URL: http://esp32.local/wifi");
+}
+
+static bool save_oauth_username(const char* device_id) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("oauth_creds", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+    
+    err = nvs_set_str(nvs_handle, "oauth_user", device_id);
+    if (err != ESP_OK) {
+        nvs_close(nvs_handle);
+        return false;
+    }
+    
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "OAuth username (device ID) saved successfully: %s", device_id);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static bool get_oauth_username(char* username, size_t max_len) {
+    nvs_handle_t nvs_handle;
+    size_t required_size;
+    
+    esp_err_t err = nvs_open("oauth_creds", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+    
+    err = nvs_get_str(nvs_handle, "oauth_user", NULL, &required_size);
+    if (err == ESP_OK && required_size <= max_len) {
+        nvs_get_str(nvs_handle, "oauth_user", username, &required_size);
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "OAuth username loaded from NVS: %s", username);
+        return true;
+    }
+    
+    nvs_close(nvs_handle);
+    return false;
+}
+
+// ========================
+// ===== TIME FUNCTIONS =====
+// ========================
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "SNTP time synchronization event received");
+    
+    // Set timezone for UAE (GST-4)
+    setenv("TZ", "GST-4", 1);
+    tzset();
+    
+    // Print synchronized time
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
+    ESP_LOGI(TAG, "✅ NTP Synchronized Local Time: %s", time_str);
+    
+    xEventGroupSetBits(s_evt_group, TIME_SYNCED_BIT);
+}
+
+static void obtain_time(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP with multiple NTP servers...");
+    
+    // Initialize SNTP with ESP-IDF v5.3 method
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    
+    // Add multiple NTP servers for redundancy
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_setservername(1, "time.google.com");
+    sntp_setservername(2, "time.windows.com");
+    sntp_setservername(3, "time.nist.gov");
+    
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+    
+    #ifdef CONFIG_LWIP_SNTP_UPDATE_DELAY
+    sntp_set_sync_interval(CONFIG_LWIP_SNTP_UPDATE_DELAY);
+    #else
+    sntp_set_sync_interval(3600000);
+    #endif
+    
+    sntp_init();
+
+    ESP_LOGI(TAG, "NTP Servers configured:");
+    ESP_LOGI(TAG, "  - pool.ntp.org");
+    ESP_LOGI(TAG, "  - time.google.com"); 
+    ESP_LOGI(TAG, "  - time.windows.com");
+    ESP_LOGI(TAG, "  - time.nist.gov");
+
+    // Wait until time is set
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    int retry = 0;
+    const int retry_count = 15;
+    
+    while (retry < retry_count) {
+        if (xEventGroupGetBits(s_evt_group) & TIME_SYNCED_BIT) {
+            ESP_LOGI(TAG, "✅ Time synchronized via callback");
+            return;
+        }
+        
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        
+        if (timeinfo.tm_year >= (2024 - 1900)) {
+            ESP_LOGI(TAG, "✅ Time synchronized successfully: Year %d", timeinfo.tm_year + 1900);
+            
+            setenv("TZ", "GST-4", 1);
+            tzset();
+            
+            xEventGroupSetBits(s_evt_group, TIME_SYNCED_BIT);
+            return;
+        }
+        
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry + 1, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        retry++;
+    }
+
+    ESP_LOGW(TAG, "⚠️ Failed to get time from NTP servers after %d attempts", retry_count);
+    
+    setenv("TZ", "GST-4", 1);
+    tzset();
+    xEventGroupSetBits(s_evt_group, TIME_SYNCED_BIT);
+}
+
+void time_sync_task(void *pvParameter) {
+    // Wait for WiFi connection first
+    xEventGroupWaitBits(s_evt_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+    
+    ESP_LOGI(TAG, "Starting time synchronization task...");
+    obtain_time();
+    
+    vTaskDelete(NULL);
+}
+
+void get_current_exact_time_string(char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) return;
+    
+    time_t now;
+    struct tm timeinfo;
+    
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+void print_current_exact_time(void) {
+    char time_str[64];
+    get_current_exact_time_string(time_str, sizeof(time_str));
+    ESP_LOGI(TAG, "🕐 CURRENT EXACT TIME: %s", time_str);
+}
+
+void get_current_exact_timestamp_string(char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) return;
+    
+    time_t now;
+    struct tm timeinfo;
+    
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+// ========================
+// ===== HTTP UTILITY FUNCTIONS =====
+// ========================
+
+static char *read_http_response(esp_http_client_handle_t client) {
+    int total_len = 0;
+    int buf_size = 512;
+    char *buf = malloc(buf_size);
+    if (!buf) return NULL;
+
+    esp_http_client_fetch_headers(client);
+
+    while (1) {
+        int r = esp_http_client_read(client, buf + total_len, buf_size - total_len - 1);
+        if (r < 0) {
+            free(buf);
+            return NULL;
+        } else if (r == 0) {
+            break;
+        }
+        total_len += r;
+        if (total_len >= buf_size - 1) {
+            buf_size *= 2;
+            char *nb = realloc(buf, buf_size);
+            if (!nb) {
+                free(buf);
+                return NULL;
+            }
+            buf = nb;
+        }
+    }
+    buf[total_len] = '\0';
+    return buf;
+}
+
+static bool build_basic_auth_header(char *out, size_t out_len) {
+    char raw[256];
+    int raw_len = snprintf(raw, sizeof(raw), "%s:%s", CLIENT_ID, CLIENT_SECRET);
+    if (raw_len < 0 || raw_len >= (int)sizeof(raw)) return false;
+
+    size_t olen = 0;
+    int rc = mbedtls_base64_encode(NULL, 0, &olen, (const unsigned char*)raw, raw_len);
+    if (rc == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && olen > 0) {
+        unsigned char *b64 = malloc(olen + 1);
+        if (!b64) return false;
+        rc = mbedtls_base64_encode(b64, olen, &olen, (const unsigned char*)raw, raw_len);
+        if (rc != 0) { free(b64); return false; }
+        b64[olen] = '\0';
+        int n = snprintf(out, out_len, "Basic %s", b64);
+        free(b64);
+        return (n > 0 && n < (int)out_len);
+    }
+    return false;
+}
+
+static char *json_get_dup(cJSON *root, const char *key) {
+    cJSON *it = cJSON_GetObjectItem(root, key);
+    if (cJSON_IsString(it) && it->valuestring) return strdup(it->valuestring);
+    return NULL;
+}
+
+static int json_get_int(cJSON *root, const char *key, int def) {
+    cJSON *it = cJSON_GetObjectItem(root, key);
+    if (cJSON_IsNumber(it)) return it->valueint;
+    return def;
+}
+
+// ========================
+// ===== DOH API FUNCTIONS =====
+// ========================
+
+static void get_current_exact_timestamp(cJSON *parent_obj) {
+    time_t now;
+    struct tm timeinfo;
+    
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // Ensure we're at exact 5-minute boundary
+    timeinfo.tm_sec = 0;
+    now = mktime(&timeinfo);
+
+    localtime_r(&now, &timeinfo);
+
+    char date_s[16], time_s[16];
+    strftime(date_s, sizeof(date_s), "%Y-%m-%d", &timeinfo);
+    strftime(time_s, sizeof(time_s), "%H:%M:%S", &timeinfo);
+
+    cJSON *ts = cJSON_CreateObject();
+    cJSON_AddStringToObject(ts, "date", date_s);
+    cJSON_AddStringToObject(ts, "time", time_s);
+    cJSON_AddItemToObject(parent_obj, "timestamp", ts);
+
+    char full_time_str[64];
+    strftime(full_time_str, sizeof(full_time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, "SENDING TO SERVER AT EXACT 5-MIN BOUNDARY: %s", full_time_str);
+}
+
+static bool fetch_oauth_token(token_state_t *tok) {
+    char username[64] = {0};
+    
+    if (!get_oauth_username(username, sizeof(username))) {
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Requesting OAuth token: %s", TOKEN_URL);
+    ESP_LOGI(TAG, "Using Device ID as username: %s", username);
+
+    char auth_hdr[384];
+    if (!build_basic_auth_header(auth_hdr, sizeof(auth_hdr))) {
+        return false;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = TOKEN_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 15000,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { return false; }
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+    
+    esp_http_client_set_header(client, "DOHGatewayAPIKey", DOHGatewayAPIKey);
+    
+    esp_http_client_set_header(client, "Ip", esp32_public_ip);
+    esp_http_client_set_header(client, "MacID", esp32_mac);
+    esp_http_client_set_header(client, "OS", "firmware v" OS_VERSION);
+
+    char post[256];
+    int n = snprintf(post, sizeof(post),
+                     "username=%s&password=%s&grant_type=password",
+                     username, OAUTH_PASSWORD);
+    if (n < 0 || n >= (int)sizeof(post)) {
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    esp_err_t err = esp_http_client_open(client, strlen(post));
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return false;
+    }
+    esp_http_client_write(client, post, strlen(post));
+    char *resp = read_http_response(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (!resp) { return false; }
+
+    bool ok = false;
+    if (status == 200) {
+        cJSON *root = cJSON_Parse(resp);
+        if (root) {
+            char *at = json_get_dup(root, "access_token");
+            int expires_in = json_get_int(root, "expires_in", 3600);
+            if (at) {
+                if (tok->access_token) free(tok->access_token);
+                tok->access_token = at;
+                time_t now; time(&now);
+                tok->expires_at = now + expires_in - 60;
+                if (tok->expires_at < now) tok->expires_at = now + expires_in;
+                ok = true;
+                ESP_LOGI(TAG, "✅ Got token; expires in %d sec, refresh_at=%ld", expires_in, (long)tok->expires_at);
+            }
+            cJSON_Delete(root);
+        }
+    } else {
+        ESP_LOGE(TAG, "❌ Token request failed with status: %d", status);
+    }
+    free(resp);
+    return ok;
+}
+
+static bool ensure_valid_token(token_state_t *tok) {
+    time_t now; time(&now);
+    if (!tok->access_token || now >= tok->expires_at) {
+        ESP_LOGI(TAG, "Token missing or expired, fetching new");
+        return fetch_oauth_token(tok);
+    }
+    return true;
+}
+
+static bool send_bulk_data(const char *access_token, sensor_data_t *sensor_data) {
+    if (!access_token || !sensor_data) return false;
+
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return false;
+    
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "uniqueRecordId", "1747149000000");
+    
+    cJSON *data = cJSON_CreateObject();
+    
+    ESP_LOGI(TAG, "=== APPLYING OFFSETS TO DOH SENSOR DATA ===");
+    ESP_LOGI(TAG, "Total offsets configured: %d", g_offset_count);
+    
+    char value_str[32];
+    
+    // PM2.5
+    if (!isnan(sensor_data->pm2_5) && sensor_data->pm2_5 >= 0) {
+        float adjusted_pm25 = apply_offset_calculation("5a54b202f1c20", sensor_data->pm2_5);
+        if (!isnan(adjusted_pm25) && adjusted_pm25 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_pm25);
+            cJSON_AddStringToObject(data, "5a54b202f1c20", value_str);
+            ESP_LOGI(TAG, "PM2.5: %.1f µg/m³", adjusted_pm25);
+        } else {
+            cJSON_AddStringToObject(data, "5a54b202f1c20", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5a54b202f1c20", "");
+    }
+    
+    // PM10
+    if (!isnan(sensor_data->pm10) && sensor_data->pm10 >= 0) {
+        float adjusted_pm10 = apply_offset_calculation("5a65aeaa75285", sensor_data->pm10);
+        if (!isnan(adjusted_pm10) && adjusted_pm10 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_pm10);
+            cJSON_AddStringToObject(data, "5a65aeaa75285", value_str);
+            ESP_LOGI(TAG, "PM10: %.1f µg/m³", adjusted_pm10);
+        } else {
+            cJSON_AddStringToObject(data, "5a65aeaa75285", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5a65aeaa75285", "");
+    }
+    
+    // CO - FIXED CONVERSION
+    if (!isnan(sensor_data->co) && sensor_data->co >= 0) {
+        float adjusted_co = apply_offset_calculation("5bd02649d73f9", sensor_data->co);
+        if (!isnan(adjusted_co) && adjusted_co >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.3f", adjusted_co);
+            cJSON_AddStringToObject(data, "5bd02649d73f9", value_str);
+            ESP_LOGI(TAG, "CO: %.3f mg/m³", adjusted_co);
+        } else {
+            cJSON_AddStringToObject(data, "5bd02649d73f9", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5bd02649d73f9", "");
+    }
+    
+    // O3
+    if (!isnan(sensor_data->o3) && sensor_data->o3 >= 0) {
+        float adjusted_o3 = apply_offset_calculation("59c10c1d8d49f", sensor_data->o3);
+        if (!isnan(adjusted_o3) && adjusted_o3 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_o3);
+            cJSON_AddStringToObject(data, "59c10c1d8d49f", value_str);
+            ESP_LOGI(TAG, "O3: %.1f µg/m³", adjusted_o3);
+        } else {
+            cJSON_AddStringToObject(data, "59c10c1d8d49f", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "59c10c1d8d49f", "");
+    }
+    
+    // NO2
+    if (!isnan(sensor_data->no2) && sensor_data->no2 >= 0) {
+        float adjusted_no2 = apply_offset_calculation("5beea162da446", sensor_data->no2);
+        if (!isnan(adjusted_no2) && adjusted_no2 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_no2);
+            cJSON_AddStringToObject(data, "5beea162da446", value_str);
+            ESP_LOGI(TAG, "NO2: %.1f µg/m³", adjusted_no2);
+        } else {
+            cJSON_AddStringToObject(data, "5beea162da446", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5beea162da446", "");
+    }
+    
+    // CO2
+    if (!isnan(sensor_data->co2) && sensor_data->co2 >= 0) {
+        float adjusted_co2 = apply_offset_calculation("59c10c1d8cffb", sensor_data->co2);
+        if (!isnan(adjusted_co2) && adjusted_co2 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_co2);
+            cJSON_AddStringToObject(data, "59c10c1d8cffb", value_str);
+            ESP_LOGI(TAG, "CO2: %.1f ppm", adjusted_co2);
+        } else {
+            cJSON_AddStringToObject(data, "59c10c1d8cffb", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "59c10c1d8cffb", "");
+    }
+    
+    // VOC
+    if (!isnan(sensor_data->voc) && sensor_data->voc >= 0) {
+        float adjusted_voc = apply_offset_calculation("59d787bc91133", sensor_data->voc);
+        if (!isnan(adjusted_voc) && adjusted_voc >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_voc);
+            cJSON_AddStringToObject(data, "59d787bc91133", value_str);
+            ESP_LOGI(TAG, "VOC: %.1f grade", adjusted_voc);
+        } else {
+            cJSON_AddStringToObject(data, "59d787bc91133", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "59d787bc91133", "");
+    }
+    
+    // CH2O
+    if (!isnan(sensor_data->ch2o) && sensor_data->ch2o >= 0) {
+        float adjusted_ch2o = apply_offset_calculation("5be03cbe9f8e9", sensor_data->ch2o);
+        if (!isnan(adjusted_ch2o) && adjusted_ch2o >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_ch2o);
+            cJSON_AddStringToObject(data, "5be03cbe9f8e9", value_str);
+            ESP_LOGI(TAG, "CH2O: %.1f µg/m³", adjusted_ch2o);
+        } else {
+            cJSON_AddStringToObject(data, "5be03cbe9f8e9", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5be03cbe9f8e9", "");
+    }
+    
+    // Temperature
+    if (!isnan(sensor_data->temperature) && sensor_data->temperature >= -40) {
+        float adjusted_temp = apply_offset_calculation("5a65ae47024f8", sensor_data->temperature);
+        if (!isnan(adjusted_temp) && adjusted_temp >= -40) {
+            snprintf(value_str, sizeof(value_str), "%.2f", adjusted_temp);
+            cJSON_AddStringToObject(data, "5a65ae47024f8", value_str);
+            ESP_LOGI(TAG, "Temperature: %.2f ℃", adjusted_temp);
+        } else {
+            cJSON_AddStringToObject(data, "5a65ae47024f8", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5a65ae47024f8", "");
+    }
+    
+    // Humidity
+    if (!isnan(sensor_data->humidity) && sensor_data->humidity >= 0) {
+        float adjusted_hum = apply_offset_calculation("5bd7065cb9d49", sensor_data->humidity);
+        if (!isnan(adjusted_hum) && adjusted_hum >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.2f", adjusted_hum);
+            cJSON_AddStringToObject(data, "5bd7065cb9d49", value_str);
+            ESP_LOGI(TAG, "Humidity: %.2f %%", adjusted_hum);
+        } else {
+            cJSON_AddStringToObject(data, "5bd7065cb9d49", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "5bd7065cb9d49", "");
+    }
+    
+    // Noise
+    if (!isnan(sensor_data->noise) && sensor_data->noise >= 0) {
+        float adjusted_noise = apply_offset_calculation("noise", sensor_data->noise);
+        if (!isnan(adjusted_noise) && adjusted_noise >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_noise);
+            cJSON_AddStringToObject(data, "noise", value_str);
+            ESP_LOGI(TAG, "Noise: %.1f dB", adjusted_noise);
+        } else {
+            cJSON_AddStringToObject(data, "noise", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "noise", "");
+    }
+    
+    // BENZENE
+    if (!isnan(sensor_data->benzene) && sensor_data->benzene >= 0) {
+        float adjusted_benzene = apply_offset_calculation("benzene", sensor_data->benzene);
+        if (!isnan(adjusted_benzene) && adjusted_benzene >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.2f", adjusted_benzene);
+            cJSON_AddStringToObject(data, "benzene", value_str);
+            ESP_LOGI(TAG, "Benzene: %.2f ppm (OFFSET APPLIED)", adjusted_benzene);
+        } else {
+            cJSON_AddStringToObject(data, "benzene", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "benzene", "");
+    }
+    
+    // SO2
+    if (!isnan(sensor_data->so2) && sensor_data->so2 >= 0) {
+        float adjusted_so2 = apply_offset_calculation("so2", sensor_data->so2);
+        if (!isnan(adjusted_so2) && adjusted_so2 >= 0) {
+            snprintf(value_str, sizeof(value_str), "%.1f", adjusted_so2);
+            cJSON_AddStringToObject(data, "so2", value_str);
+            ESP_LOGI(TAG, "SO2: %.1f µg/m³ (OFFSET APPLIED)", adjusted_so2);
+        } else {
+            cJSON_AddStringToObject(data, "so2", "");
+        }
+    } else {
+        cJSON_AddStringToObject(data, "so2", "");
+    }
+
+    cJSON_AddItemToObject(obj, "data", data);
+    get_current_exact_timestamp(obj);
+    cJSON_AddItemToArray(arr, obj);
+    
+    char *payload = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    if (!payload) {
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Final DOH payload: %s", payload);
+
+    ESP_LOGI(TAG, "=== DOH API REQUEST ===");
+    ESP_LOGI(TAG, "URL: %s", DATA_URL);
+    ESP_LOGI(TAG, "DOHGatewayAPIKey: %s", DOHGatewayAPIKey);
+    ESP_LOGI(TAG, "IP: %s (Public IP)", esp32_public_ip); 
+    ESP_LOGI(TAG, "MAC: %s", esp32_mac);
+    ESP_LOGI(TAG, "Payload size: %d bytes", strlen(payload));
+    ESP_LOGI(TAG, "=========================");
+
+    esp_http_client_config_t cfg = {
+        .url = DATA_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms =30000,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { 
+        free(payload); 
+        return false; 
+    }
+    
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    
+    char auth_hdr[1024];
+    int n = snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", access_token);
+    if (n < 0 || n >= (int)sizeof(auth_hdr)) { 
+        esp_http_client_cleanup(client); 
+        free(payload); 
+        return false; 
+    }
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+    
+    esp_http_client_set_header(client, "DOHGatewayAPIKey", DOHGatewayAPIKey);
+   
+    esp_http_client_set_header(client, "Ip", esp32_public_ip);  // Use private IP
+    esp_http_client_set_header(client, "MacID", esp32_mac);
+    esp_http_client_set_header(client, "OS", "firmware v" OS_VERSION);
+    
+    esp_http_client_set_post_field(client, payload, strlen(payload));
+    
+    ESP_LOGI(TAG, "Sending data to DOH server...");
+    
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+    
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        char *resp = read_http_response(client);
+        
+        ESP_LOGI(TAG, "=== DOH API RESPONSE ===");
+        ESP_LOGI(TAG, "HTTP Status: %d", status);
+        if (resp) { 
+            ESP_LOGI(TAG, "Response: %s", resp); 
+            free(resp); 
+        }
+        ESP_LOGI(TAG, "========================");
+        
+        ok = (status == 200 || status == 201);
+        if (ok) {
+            ESP_LOGI(TAG, "✅ Data sent successfully to DOH server");
+        } else {
+            ESP_LOGE(TAG, "❌ Failed to send data to DOH server");
+        }
+    } else {
+        ESP_LOGE(TAG, "❌ HTTP request failed: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(payload);
+    return ok;
+}
+
+static void send_data_now(sensor_data_t *sensor_data) {
+    EventBits_t bits = xEventGroupGetBits(s_evt_group);
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        ESP_LOGW(TAG, "Cannot send data - WiFi not connected");
+        return;
+    }
+    
+    if (!(bits & TIME_SYNCED_BIT)) {
+        ESP_LOGW(TAG, "Cannot send data - Time not synchronized");
+        return;
+    }
+    
+    get_network_info();
+
+    char username[64] = {0};
+    if (!get_oauth_username(username, sizeof(username))) {
+        ESP_LOGE(TAG, "Cannot send data - No OAuth username");
+        return;
+    }
+
+    if (!ensure_valid_token(&g_token)) {
+        ESP_LOGE(TAG, "Cannot send data - Invalid token");
+        return;
+    }
+
+    bool ok = send_bulk_data(g_token.access_token, sensor_data);
+    ESP_LOGI(TAG, "Data send result -> %s", ok ? "SUCCESS" : "FAIL");
+}
+
+// ========================
+// ===== HTTP SERVER FUNCTIONS =====
+// ========================
+
+static void connect_sta_task(void *pvParameter) {
+    ESP_LOGI(TAG, "connect_sta_task: starting");
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+
+    wifi_config_t sta_cfg = { 0 };
+    strncpy((char*)sta_cfg.sta.ssid, received_ssid, sizeof(sta_cfg.sta.ssid)-1);
+    strncpy((char*)sta_cfg.sta.password, received_pass, sizeof(sta_cfg.sta.password)-1);
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "connect_sta_task: STA connection initiated");
+    vTaskDelete(NULL);
+}
+
+static esp_err_t post_handler(httpd_req_t *req) {
+    char buf[1024];
+    int r = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (r <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[r] = '\0';
+    ESP_LOGI(TAG, "Received JSON: %s", buf);
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
+    cJSON *pass = cJSON_GetObjectItem(root, "password");
+    cJSON *id_json = cJSON_GetObjectItem(root, "deviceid");
+    cJSON *offsets_json = cJSON_GetObjectItem(root, "offsets");
+    
+    if (!cJSON_IsString(ssid) || !cJSON_IsString(pass) || !cJSON_IsString(id_json)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing required fields");
+        return ESP_FAIL;
+    }
+
+    strncpy(received_ssid, ssid->valuestring, sizeof(received_ssid)-1);
+    strncpy(received_pass, pass->valuestring, sizeof(received_pass)-1);
+    strncpy(device_id, id_json->valuestring, sizeof(device_id)-1);
+    
+    received_ssid[sizeof(received_ssid)-1] = '\0';
+    received_pass[sizeof(received_pass)-1] = '\0';
+    device_id[sizeof(device_id)-1] = '\0';
+
+    if (cJSON_IsArray(offsets_json)) {
+        parse_offsets_from_wifi(offsets_json);
+    } else {
+        g_offset_count = 0;
+    }
+    
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Provisioning creds received");
+    ESP_LOGI(TAG, "SSID: %s", received_ssid);
+    ESP_LOGI(TAG, "Device ID: %s", device_id);
+
+    nvs_handle_t nvs_handle;
+    ESP_ERROR_CHECK(nvs_open("wifi_creds", NVS_READWRITE, &nvs_handle));
+    ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "ssid", received_ssid));
+    ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "password", received_pass));
+    ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "deviceid", device_id));
+    
+    if (g_offset_count > 0) {
+        cJSON *offsets_array = cJSON_CreateArray();
+        for (int i = 0; i < g_offset_count; i++) {
+            cJSON *offset_obj = cJSON_CreateObject();
+            const char* param_name = "Unknown";
+            for (int j = 0; j < g_param_mapping_count; j++) {
+                if (strcmp(g_param_mapping[j].sensor_id, g_offsets[i].parameter_id) == 0) {
+                    param_name = g_param_mapping[j].param_name;
+                    break;
+                }
+            }
+            cJSON_AddStringToObject(offset_obj, "param", param_name);
+            cJSON_AddNumberToObject(offset_obj, "x", g_offsets[i].x_offset);
+            cJSON_AddNumberToObject(offset_obj, "y", g_offsets[i].y_offset);
+            cJSON_AddItemToArray(offsets_array, offset_obj);
+        }
+        char *offsets_str = cJSON_PrintUnformatted(offsets_array);
+        if (offsets_str) {
+            ESP_ERROR_CHECK(nvs_set_str(nvs_handle, "offsets", offsets_str));
+            free(offsets_str);
+        }
+        cJSON_Delete(offsets_array);
+    } else {
+        nvs_set_str(nvs_handle, "offsets", "");
+    }
+    
+    ESP_ERROR_CHECK(nvs_commit(nvs_handle));
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Wi-Fi credentials, Device ID and offsets saved in NVS");
+
+    save_oauth_username(device_id);
+
+    // Update AP name with device ID
+    update_ap_name_with_device_id();
+
+    httpd_resp_sendstr(req, "Wi-Fi credentials, Device ID and offsets received");
+
+    xTaskCreate(connect_sta_task, "connect_sta_task", 4096, NULL, 6, NULL);
+
+    return ESP_OK;
+}
+
+static void load_offsets_from_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("wifi_creds", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        return;
+    }
+    
+    size_t offsets_len = 0;
+    err = nvs_get_str(nvs_handle, "offsets", NULL, &offsets_len);
+    if (err == ESP_OK && offsets_len > 1) {
+        char *offsets_str = malloc(offsets_len);
+        if (offsets_str) {
+            nvs_get_str(nvs_handle, "offsets", offsets_str, &offsets_len);
+            cJSON *offsets_array = cJSON_Parse(offsets_str);
+            if (offsets_array) {
+                parse_offsets_from_wifi(offsets_array);
+                cJSON_Delete(offsets_array);
+            }
+            free(offsets_str);
+        }
+    }
+    nvs_close(nvs_handle);
+}
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri = {
+            .uri = "/wifi",
+            .method = HTTP_POST,
+            .handler = post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &uri);
+        ESP_LOGI(TAG, "HTTP server started at /wifi");
+        return server;
+    } else {
+        return NULL;
+    }
+}
+
+static void start_softap(void) {
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .channel = WIFI_AP_CHANNEL,
+            .password = WIFI_AP_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_OPEN
+        },
+    };
+    
+    // Use hardcoded IAQ_ as initial AP name
+    strncpy((char*)ap_config.ap.ssid, wifi_ap_ssid, sizeof(ap_config.ap.ssid)-1);
+    ap_config.ap.ssid_len = strlen(wifi_ap_ssid);
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+}
+
+// ========================
+// ===== TASK FUNCTIONS =====
+// ========================
+
+static void data_task(void *arg) {
+    ESP_LOGI(TAG, "Data task started (minimal mode - sending handled in sensor task)");
+    
+    while (1) {
+        // This task is now minimal since sending happens in sensor_task
+        vTaskDelay(pdMS_TO_TICKS(60000)); // Just sleep
+    }
+}
+
+// ========================
+static void sensor_task(void *arg) {
+    sensor_data_t sensor_data;
+    
+    uart_init();
+    ESP_ERROR_CHECK(i2c_master_init());
+    initialize_zs11_sensor();
+    mux_init();
+    benzene_adc_init();
+    init_voc_gpio();
+
+    // Initialize 5-minute window
+    statsReset(&g_stats);
+    g_windowOpen = false;
+    last_bucket_index = 0; // Use the global variable
+
+    ESP_LOGI(TAG, "Warming up sensors for 20 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(20000));
+
+    int cycle_count = 0;
+    uint32_t current_bucket_index = 0;
+    
+    // Wait for initial synchronization
+    xEventGroupWaitBits(s_evt_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+    xEventGroupWaitBits(s_evt_group, TIME_SYNCED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+    
+    ESP_LOGI(TAG, "=== STARTING SENSOR READING WITH 5-MINUTE BUCKET AVERAGING ===");
+    
+    while (1) {
+        cycle_count++;
+        
+        // Get current UTC time
+        time_t utcNow;
+        time(&utcNow);
+        
+        // Calculate bucket index (5-minute windows)
+        current_bucket_index = (uint32_t)(utcNow / BUCKET_SIZE_SECONDS);
+        
+        // Initialize window if first sample after boot
+        if (!g_windowOpen) {
+            g_windowOpen = true;
+            last_bucket_index = current_bucket_index;
+            statsReset(&g_stats);
+            ESP_LOGI(TAG, "First sample - starting 5-minute window with bucket index: %lu", current_bucket_index);
+        }
+        
+        // Check if bucket changed (5-minute window completed)
+        if (current_bucket_index != last_bucket_index) {
+            ESP_LOGI(TAG, "=== 5-MINUTE WINDOW COMPLETED ===");
+            ESP_LOGI(TAG, "Bucket index changed: %lu -> %lu", last_bucket_index, current_bucket_index);
+            
+            // Process the completed 5-minute window (this sends to BOTH server and UART)
+            process_5min_window();
+            
+            // Start new window for current bucket
+            last_bucket_index = current_bucket_index;
+            statsReset(&g_stats);
+            ESP_LOGI(TAG, "Started new 5-minute window with bucket index: %lu", current_bucket_index);
+            
+            // Wait a bit after server operations before continuing sensor readings
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        
+        // Read sensors
+        ESP_LOGI(TAG, "=== CYCLE %d ===", cycle_count);
+        ESP_LOGI(TAG, "Current bucket index: %lu", current_bucket_index);
+        ESP_LOGI(TAG, "Last completed bucket index: %lu", last_bucket_index);
+        
+        read_all_sensors_complete(&sensor_data);
+        
+        if (sensor_data.data_valid) {
+            // Accumulate data into current 5-minute window
+            statsAccumulate(&g_stats,
+                           sensor_data.aqi, sensor_data.pm2_5, sensor_data.pm10,
+                           sensor_data.co, sensor_data.o3, sensor_data.no2, sensor_data.co2,
+                           sensor_data.ch2o, sensor_data.temperature, sensor_data.humidity,
+                           sensor_data.voc, sensor_data.noise, sensor_data.benzene, sensor_data.so2);
+            
+            ESP_LOGI(TAG, "Data accumulated into 5-minute window (%" PRIu32 " samples)", g_stats.pm25.count);
+            
+        } else {
+            ESP_LOGW(TAG, "Sensor data invalid - skipping accumulation");
+        }
+        
+        ESP_LOGI(TAG, "✅ Completed cycle %d", cycle_count);
+        
+        // Wait 5 seconds until next reading
+        ESP_LOGI(TAG, "⏰ Waiting 5 seconds until next reading...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+// ========================
+// ===== MAIN FUNCTION =====
+// ========================
+
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+     public_ip_component_init();
+    s_evt_group = xEventGroupCreate();
+    sensor_data_queue = xQueueCreate(1, sizeof(sensor_data_t));
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    
+    start_softap();
+    
+    get_network_info();
+    
+    initialize_mdns();
+    
+    s_http_server = start_webserver();
+    
+    xTaskCreate(time_sync_task, "time_sync_task", 4096, NULL, 6, NULL);
+    xTaskCreate(sensor_task, "sensor_task", 8192, NULL, 5, NULL);
+    xTaskCreate(data_task, "data_task", 8192, NULL, 4, NULL);
+
+    nvs_handle_t nvs_handle;
+    ret = nvs_open("wifi_creds", NVS_READONLY, &nvs_handle);
+    if (ret == ESP_OK) {
+        size_t ssid_len = sizeof(received_ssid);
+        size_t pass_len = sizeof(received_pass);
+        size_t id_len = sizeof(device_id);
+        if (nvs_get_str(nvs_handle, "ssid", received_ssid, &ssid_len) == ESP_OK &&
+            nvs_get_str(nvs_handle, "password", received_pass, &pass_len) == ESP_OK &&
+            nvs_get_str(nvs_handle, "deviceid", device_id, &id_len) == ESP_OK) {
+
+            nvs_close(nvs_handle);
+            ESP_LOGI(TAG, "Found saved Wi-Fi config. Connecting STA...");
+            
+            // Update AP name with saved device ID
+            update_ap_name_with_device_id();
+            
+            load_offsets_from_nvs();
+            
+            xTaskCreate(connect_sta_task, "connect_sta_task", 4096, NULL, 6, NULL);
+        } else {
+            nvs_close(nvs_handle);
+            ESP_LOGI(TAG, "No saved Wi-Fi credentials found. AP active for configuration.");
+        }
+    } else {
+        ESP_LOGI(TAG, "No saved Wi-Fi credentials found. AP active for configuration.");
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "=== AIR QUALITY MONITOR STARTED ===");
+    ESP_LOGI(TAG, "Time synchronization: NTP via pool.ntp.org");
+    ESP_LOGI(TAG, "Timezone: GST-4 (UAE Standard Time)");
+    ESP_LOGI(TAG, "Data intervals: 5-SECOND READINGS WITH 5-MINUTE BUCKET AVERAGING");
+    ESP_LOGI(TAG, "Bucket system: All samples with same (utc/300) go into same 5-min window");
+    ESP_LOGI(TAG, "Server sending: At 5-minute boundaries with averaged data");
+    ESP_LOGI(TAG, "UART Format: AQI_STATUS=123,WIFI_STATUS=1,INTERNET_STATUS=1,sensor_values...");
+    ESP_LOGI(TAG, "SoftAP SSID: %s", wifi_ap_ssid);
+    ESP_LOGI(TAG, "mDNS URL: http://esp32.local/wifi");
+    ESP_LOGI(TAG, "Device MAC: %s", esp32_mac);
+    
+    print_current_exact_time();
+}
